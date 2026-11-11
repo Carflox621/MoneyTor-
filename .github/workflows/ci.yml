@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # PostgreSQL efímero solo para el job. Las credenciales son descartables y
+    # no corresponden a ningún entorno real; no se usan secretos del repositorio.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: moneytor
+          POSTGRES_PASSWORD: moneytor_ci
+          POSTGRES_DB: moneytor
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U moneytor -d moneytor"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://moneytor:moneytor_ci@localhost:5432/moneytor
+      TEST_DATABASE_URL: postgresql+psycopg://moneytor:moneytor_ci@localhost:5432/moneytor_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Ruff (análisis estático)
+        run: ruff check .
+
+      - name: Ruff (formato)
+        run: ruff format --check .
+
+      - name: Crear base de pruebas
+        run: psql -h localhost -U moneytor -d moneytor -c "CREATE DATABASE moneytor_test"
+        env:
+          PGPASSWORD: moneytor_ci
+
+      - name: Migraciones sobre base vacía
+        run: alembic upgrade head
+
+      - name: Pruebas con cobertura (unitarias + integración)
+        run: pytest --cov --cov-report=term-missing
