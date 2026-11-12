@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 
-from app.routers import products
+from app.routers import history, products
 
 app = FastAPI(
     title="MoneyTor",
-    version="0.2.0",
-    description="Monitor de precios MoneyTor (etapa 2: productos y revisión de precios).",
+    version="0.3.0",
+    description="Monitor de precios MoneyTor (etapa 3: revisión e historial de precios).",
 )
 app.include_router(products.router)
+app.include_router(history.router)

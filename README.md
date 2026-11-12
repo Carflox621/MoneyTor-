@@ -4,11 +4,12 @@ Monitor de precios de productos. El objetivo del proyecto es que una persona reg
 producto, y que el sistema —en etapas posteriores— obtenga su precio de fuentes permitidas, guarde el
 historial, detecte cuándo se alcanza un precio objetivo y notifique.
 
-> **Estado actual: etapa 2.** MoneyTor es una API REST para **registrar productos** y **revisar su
+> **Estado actual: etapa 3.** MoneyTor es una API REST para **registrar productos** y **revisar su
 > precio** bajo demanda (`POST /products/{id}/check`) en una fuente permitida
 > ([Books to Scrape](https://books.toscrape.com/), un sandbox pensado para ser scrapeado). Cada
 > revisión queda registrada (éxito o fallo) y cada precio válido se guarda en el historial.
-> **Aún no hay** consulta del historial, estadísticas, tareas programadas ni notificaciones. Ver [Estado y hoja de ruta](#estado-y-hoja-de-ruta).
+> El historial de precios, sus estadísticas y las ejecuciones se consultan con tres `GET` de solo
+> lectura. **Aún no hay** comparación con el precio objetivo, tareas programadas ni notificaciones. Ver [Estado y hoja de ruta](#estado-y-hoja-de-ruta).
 
 ## Stack
 
@@ -36,6 +37,7 @@ app/
   schemas.py         ProductCreate (valida y normaliza), ProductOut, CheckResultOut
   urls.py            normalize_url() y store_from_url(): lógica pura, sin red ni BD
   routers/products.py
+  routers/history.py  GET history / stats / check-runs (solo lectura)
   services/
     fetcher.py       HTTP + defensas SSRF (no conoce tiendas ni la BD)
     stores.py        SUPPORTED_STORES (allowlist host -> parser) y parse_books()
@@ -128,6 +130,9 @@ API en <http://127.0.0.1:8000> y documentación interactiva en <http://127.0.0.1
 | `POST` | `/products` | `201` creado · `409` URL ya registrada (incluye `existing_id`) · `422` datos inválidos |
 | `GET` | `/products?limit=50&offset=0` | `200` (orden por `id`; `limit` 1–100) · `422` paginación inválida |
 | `GET` | `/products/{id}` | `200` · `404` no existe · `422` id no válido |
+| `GET` | `/products/{id}/history` | `200` lista (más reciente primero) · `404` · `422` |
+| `GET` | `/products/{id}/stats` | `200` estadísticas por moneda · `404` · `422` |
+| `GET` | `/products/{id}/check-runs` | `200` lista de ejecuciones · `404` · `422` |
 
 Ejemplo (PowerShell):
 
@@ -192,6 +197,50 @@ distintos se revisan en paralelo.
 solo el símbolo `£`, que se mapea a `GBP`; `robots.txt` responde 404; sitio estático: sus precios
 son ficticios y **no cambian**, por lo que los cambios de precio solo se prueban con fixtures).
 
+### Consulta de historial, estadísticas y ejecuciones (etapa 3)
+
+Solo lectura; no escriben nada ni requieren migraciones. Un producto sin datos responde `200` con
+lista vacía (`by_currency: []` en estadísticas); un producto inexistente, `404`.
+
+| Endpoint | Parámetros |
+|---|---|
+| `GET /products/{id}/history` | `limit` (1-100, def. 50), `offset`, `from`, `to` |
+| `GET /products/{id}/check-runs` | `limit`, `offset`, `status` (`success` \| `error`) |
+| `GET /products/{id}/stats` | `from`, `to` |
+
+- **Listas simples** (como `GET /products`), de la más reciente a la más antigua. Orden
+  determinista: fecha descendente y, ante empate, `id` descendente.
+- **`from` / `to`:** inclusivos y **con zona horaria obligatoria** (`2026-01-01T12:00:00Z` o con
+  desplazamiento). Sin zona, con formato inválido o `from` posterior a `to` → `422`. En una URL el
+  `+` de un desplazamiento debe ir como `%2B` (o usar `Z`); un `+` sin codificar llega como espacio y
+  se rechaza en lugar de interpretarse mal.
+- **`/history`:** `id`, `check_run_id`, `price` (texto exacto), `currency`, `price_raw`,
+  `observed_at`, `source_url`.
+- **`/check-runs`:** `id`, `status`, `error_code`, `error_message`, `http_status`, `started_at`,
+  `finished_at`, `duration_ms` (las ejecuciones fallidas conservan su causa).
+- **`/stats`:** un bloque **por moneda** (nunca se mezclan ni se convierten), ordenado por código:
+
+```json
+{ "product_id": 1, "by_currency": [
+  { "currency": "GBP", "count": 5,
+    "min": "49.99", "min_observed_at": "...", "max": "53.74", "max_observed_at": "...",
+    "first": "51.77", "first_observed_at": "...", "latest": "52.00", "latest_observed_at": "...",
+    "change": "0.23", "change_pct": "0.44" } ] }
+```
+
+`change = latest - first`; `change_pct = change / first * 100` redondeado a 2 decimales (mitad hacia
+arriba). Todo en `Decimal`; los importes viajan como texto, nunca como `float`. Si el mínimo o el
+máximo se repiten, su fecha es la de la ocurrencia **más reciente**. Con una sola observación el
+cambio es `0.00`.
+
+**Consistencia:** las estadísticas se calculan con **una única sentencia SQL**, por lo que
+PostgreSQL les da una sola instantánea de los datos (aislamiento `READ COMMITTED` por defecto, sin
+modificar nada global): `count`, `min`, `max`, primero y último son coherentes entre sí aunque otra
+transacción inserte observaciones a la vez.
+
+> Books to Scrape es estático: sus precios no cambian, así que con la fuente real las estadísticas
+> mostrarán `change = 0.00`. Las variaciones se verifican con datos sembrados en las pruebas.
+
 ### Verificación manual contra el sitio real (no forma parte del CI)
 
 ```powershell
@@ -251,7 +300,7 @@ migraciones sobre base vacía y `pytest --cov`. No usa secretos ni depende de ni
 | 0–1 | Registro y consulta de productos, normalización de URL, PostgreSQL, Alembic, pruebas | Implementada |
 | 1.5 | Ruff, cobertura, CI | Implementada (CI en GitHub Actions) |
 | 2 | Revisión de precios (`POST /check`), `check_runs`, `price_history`, fuente Books to Scrape | Implementada |
-| 3 | Consulta de historial y estadísticas (`GET`) | Pendiente |
+| 3 | Consulta de historial, estadísticas y ejecuciones (`GET`) | Implementada |
 | 4 | Detección de precio objetivo | Pendiente |
 | 5 | Revisiones periódicas | Pendiente |
 | 6 | Notificaciones | Pendiente |
