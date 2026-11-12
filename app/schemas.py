@@ -51,3 +51,30 @@ class ProductOut(BaseModel):
     store: str
     target_price: Decimal | None
     created_at: datetime
+
+
+class CheckRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    status: str
+    http_status: int | None
+    started_at: datetime
+    finished_at: datetime
+    duration_ms: int
+
+
+class ObservationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    price: Decimal
+    currency: str
+    price_raw: str
+    observed_at: datetime
+    source_url: str
+
+
+class CheckResultOut(BaseModel):
+    check_run: CheckRunOut
+    observation: ObservationOut
