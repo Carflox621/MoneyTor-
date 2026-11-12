@@ -4,21 +4,23 @@ Monitor de precios de productos. El objetivo del proyecto es que una persona reg
 producto, y que el sistema —en etapas posteriores— obtenga su precio de fuentes permitidas, guarde el
 historial, detecte cuándo se alcanza un precio objetivo y notifique.
 
-> **Estado actual: etapa 1.** Hoy MoneyTor es una API REST para **registrar y consultar productos**
-> (URL normalizada, nombre opcional y precio objetivo opcional) con persistencia en PostgreSQL,
-> migraciones y pruebas automatizadas. **No obtiene precios todavía** (no hay scraping, historial,
-> tareas programadas ni notificaciones). Ver [Estado y hoja de ruta](#estado-y-hoja-de-ruta).
+> **Estado actual: etapa 2.** MoneyTor es una API REST para **registrar productos** y **revisar su
+> precio** bajo demanda (`POST /products/{id}/check`) en una fuente permitida
+> ([Books to Scrape](https://books.toscrape.com/), un sandbox pensado para ser scrapeado). Cada
+> revisión queda registrada (éxito o fallo) y cada precio válido se guarda en el historial.
+> **Aún no hay** consulta del historial, estadísticas, tareas programadas ni notificaciones. Ver [Estado y hoja de ruta](#estado-y-hoja-de-ruta).
 
 ## Stack
 
 | Área | Tecnología |
 |---|---|
-| Lenguaje | Python 3.11+ (desarrollado con 3.12) |
+| Lenguaje | Python 3.11.5+ (desarrollado con 3.12; `soupsieve` exige 3.11.5) |
 | API | FastAPI + Pydantic v2 (documentación OpenAPI automática en `/docs`) |
 | Base de datos | PostgreSQL (probado con 18.4) |
 | Acceso a datos | SQLAlchemy 2.1 (síncrono, estilo 2.0) + psycopg 3 |
 | Migraciones | Alembic |
 | Configuración | pydantic-settings (`.env` / variables de entorno) |
+| Extracción | httpx2 (HTTP) + BeautifulSoup (`html.parser`) |
 | Calidad | pytest, pytest-cov, Ruff, GitHub Actions |
 
 ## Arquitectura
@@ -30,12 +32,16 @@ app/
   main.py            FastAPI() + include_router
   config.py          Settings (lee DATABASE_URL / TEST_DATABASE_URL del entorno o de .env)
   db.py              engine, SessionLocal, Base (con convención de nombres), get_db()
-  models.py          Product
-  schemas.py         ProductCreate (valida y normaliza), ProductOut
+  models.py          Product, CheckRun, PriceHistory
+  schemas.py         ProductCreate (valida y normaliza), ProductOut, CheckResultOut
   urls.py            normalize_url() y store_from_url(): lógica pura, sin red ni BD
   routers/products.py
-alembic/             env.py y versions/0001_create_products.py
-tests/               conftest.py, test_urls.py, test_products.py, test_migrations.py
+  services/
+    fetcher.py       HTTP + defensas SSRF (no conoce tiendas ni la BD)
+    stores.py        SUPPORTED_STORES (allowlist host -> parser) y parse_books()
+    checker.py       orquesta la revisión; única pieza que escribe check_runs/price_history
+alembic/             env.py y versions/ (0001 products, 0002 check_runs + price_history)
+tests/               conftest.py, fixtures/books_toscrape/ y un módulo de pruebas por componente
 .github/workflows/   ci.yml
 ```
 
@@ -43,10 +49,18 @@ Flujo de `POST /products`: Pydantic valida y normaliza la URL → el router deri
 `INSERT` → si salta el `UNIQUE(url)` de PostgreSQL se responde `409`. La unicidad la decide la base de
 datos (no un `SELECT` previo), por lo que es segura ante peticiones concurrentes.
 
+### Revisión de precios (etapa 2)
+
+`POST /products/{id}/check` -> `fetcher` (HTTP seguro) -> `stores.parse_*` (extracción y validación)
+-> `checker` (persistencia atómica). Tablas nuevas: `check_runs` (un intento, éxito o fallo) y
+`price_history` (una observación válida, ligada 1:1 a su ejecución mediante una FK compuesta que obliga
+a que ambas pertenezcan al mismo producto; guarda `price` exacto, `currency` ISO 4217 y el texto
+original `price_raw`).
+
 ## Requisitos previos
 
 - Windows con PowerShell (las instrucciones están verificadas en Windows; en Linux/macOS cambian solo las rutas).
-- Python 3.11 o superior.
+- Python 3.11.5 o superior.
 - PostgreSQL instalado localmente. En Windows, `psql.exe` suele estar en
   `C:\Program Files\PostgreSQL\<versión>\bin\` y normalmente **no** está en el `PATH`.
 - No se necesita Docker.
@@ -138,6 +152,55 @@ curl.exe http://127.0.0.1:8000/products
 curl.exe http://127.0.0.1:8000/products/1
 ```
 
+### `POST /products/{id}/check`
+
+Sin cuerpo. Solo funciona para tiendas soportadas (hoy `books.toscrape.com`).
+
+| Resultado | HTTP | `detail.code` | ¿Se registra `check_runs`? |
+|---|---|---|---|
+| Precio extraído y guardado | `201` (`check_run` + `observation`) | — | sí, + `price_history` |
+| `id` inválido | `422` | (validación estándar) | no |
+| Producto inexistente | `404` | — | no |
+| Tienda no soportada | `422` | `unsupported_store` | no (no hay ejecución) |
+| Revisado hace < 60 s | `429` + `Retry-After` | `too_soon` | no |
+| Otra revisión del mismo producto en curso | `429` + `Retry-After` | `check_in_progress` | no |
+| Tiempo de espera agotado | `504` | `timeout` | sí (error) |
+| El destino falla o no es fiable | `502` | `upstream_http_error`, `redirect_not_allowed`, `bad_content_type`, `too_large`, `blocked_destination`, `fetch_failed`, `parse_error`, `unsupported_currency` | sí (error) |
+| Error al guardar la observación | `500` | `persist_failed` | sí (error), sin precio |
+
+```json
+{ "check_run": { "id": 1, "status": "success", "http_status": 200, "started_at": "...",
+                 "finished_at": "...", "duration_ms": 765 },
+  "observation": { "id": 1, "price": "51.77", "currency": "GBP", "price_raw": "£51.77",
+                   "observed_at": "...", "source_url": "https://books.toscrape.com/..." } }
+```
+
+Los errores nuevos usan `detail` como objeto con `code` (los `404`/`409` históricos conservan su
+formato). Nunca se devuelve contenido del destino. Un fallo **nunca** inserta un precio.
+
+**Seguridad de las conexiones salientes:** allowlist de hosts (`SUPPORTED_STORES`), siempre HTTPS
+en el puerto 443, resolución DNS comprobada (se rechaza si alguna IP no es pública, incluidas
+`::ffff:127.0.0.1` y `169.254.169.254`), **ninguna redirección**, sin proxies ni variables de
+entorno, tope de 1 MiB sobre bytes ya descomprimidos, plazo total de 15 s y `Content-Type: text/html`.
+Riesgo residual conocido: DNS rebinding entre la comprobación y la conexión (host fijo y público).
+
+**Concurrencia:** un advisory lock de PostgreSQL por producto, en una conexión dedicada, impide dos
+revisiones simultáneas del mismo producto (la segunda recibe `429 check_in_progress`); productos
+distintos se revisan en paralelo.
+
+**Fuente actual:** Books to Scrape (HTML sin JavaScript; precio en `div.product_main p.price_color`,
+solo el símbolo `£`, que se mapea a `GBP`; `robots.txt` responde 404; sitio estático: sus precios
+son ficticios y **no cambian**, por lo que los cambios de precio solo se prueban con fixtures).
+
+### Verificación manual contra el sitio real (no forma parte del CI)
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/products -H "Content-Type: application/json" `
+  -d '{\"url\":\"https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html\"}'
+curl.exe -X POST http://127.0.0.1:8000/products/1/check      # 201, price 51.77, GBP
+curl.exe -X POST http://127.0.0.1:8000/products/1/check      # 429 too_soon (antes de 60 s)
+```
+
 ### Reglas de entrada
 
 - **url** (obligatoria): solo `http`/`https`, máx. 2048 caracteres, sin credenciales (`user:pass@`),
@@ -169,10 +232,11 @@ no vacío, longitud de `name` y `target_price > 0`.
   `moneytor_test`, o coincide con `DATABASE_URL`, la sesión aborta antes de tocar nada.
 - El esquema de prueba se construye con las migraciones reales (`downgrade base` + `upgrade head`).
 - Hay pruebas unitarias (normalización de URLs, incluidos rechazos de seguridad e idempotencia) y de
-  integración (endpoints, validaciones, concurrencia real con 8 hilos, restricciones de PostgreSQL y
-  ciclo de migraciones). Las advertencias de pytest se tratan como errores.
-- Cobertura medida (con ramas): ~98 %. Lo único sin cubrir es `get_db()`, que las pruebas sustituyen a
-  propósito por una sesión de la base de pruebas.
+  integración (endpoints, validaciones, concurrencia real con 8 hilos, restricciones de PostgreSQL,
+  atomicidad de la revisión y ciclo de migraciones). **Ningún test usa la red**: el HTTP se simula con
+  `httpx2.MockTransport` + fixtures HTML y un guard automático impide sockets/DNS hacia fuera. Las advertencias de pytest se tratan como errores.
+- Cobertura medida (con ramas): ~97 %. Sin cubrir: `get_db()`, `get_http_client()` y `get_resolver()`
+  (las pruebas los sustituyen a propósito) y algunas ramas de error defensivas.
 
 ## Integración continua
 
@@ -185,9 +249,9 @@ migraciones sobre base vacía y `pytest --cov`. No usa secretos ni depende de ni
 | Etapa | Contenido | Estado |
 |---|---|---|
 | 0–1 | Registro y consulta de productos, normalización de URL, PostgreSQL, Alembic, pruebas | Implementada |
-| 1.5 | Ruff, cobertura, CI | Configurada (el workflow aún no se ha ejecutado en GitHub) |
-| 2 | Historial de precios + una fuente que permita acceso automatizado | Pendiente |
-| 3 | Historial y estadísticas | Pendiente |
+| 1.5 | Ruff, cobertura, CI | Implementada (CI en GitHub Actions) |
+| 2 | Revisión de precios (`POST /check`), `check_runs`, `price_history`, fuente Books to Scrape | Implementada |
+| 3 | Consulta de historial y estadísticas (`GET`) | Pendiente |
 | 4 | Detección de precio objetivo | Pendiente |
 | 5 | Revisiones periódicas | Pendiente |
 | 6 | Notificaciones | Pendiente |
@@ -201,8 +265,9 @@ autorizadas y datos estructurados, y **no** intentar evadir CAPTCHAs ni bloqueos
 - No hay autenticación ni usuarios; cualquiera con acceso a la API puede registrar productos.
 - No existen `PUT`/`PATCH`/`DELETE`: los productos no se pueden modificar ni borrar desde la API.
 - Quitar `www.` asume que `www.x.com` y `x.com` son el mismo sitio.
-- La validación contra IPs privadas se hace sobre la URL escrita; no resuelve DNS (la API no hace
-  peticiones salientes todavía). Cuando exista el scraping, la resolución DNS y las redirecciones
-  deberán revalidarse en el momento de la petición y limitarse a tiendas soportadas.
-- Sin precios ni moneda: `target_price` se guarda, pero aún no se compara con nada.
-- Probado solo en Windows con PostgreSQL 18; el CI usa Linux con PostgreSQL 18 pero aún no se ha ejecutado.
+- La validación de `app/urls.py` al registrar un producto es solo sintáctica; la defensa SSRF real
+  vive en `services/fetcher.py` y se aplica en cada petición (allowlist, DNS, sin redirecciones).
+- `target_price` se guarda, pero aún no se compara con el precio observado (etapa 4).
+- Solo hay una tienda soportada; la moneda se registra por observación, no por producto.
+- Una revisión mantiene una conexión dedicada a la BD durante la petición HTTP (hasta 15 s).
+- Probado solo en Windows con PostgreSQL 18; el CI (Linux, PostgreSQL 18) pasa en GitHub Actions.

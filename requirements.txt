@@ -4,3 +4,6 @@ sqlalchemy==2.1.8
 psycopg[binary]==3.3.8
 alembic==1.20.1
 pydantic-settings==2.16.2
+# Cliente HTTP del scraper (el mismo que usa starlette.testclient) y parser HTML.
+httpx2==2.16.0
+beautifulsoup4==4.15.0
