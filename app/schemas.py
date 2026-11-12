@@ -78,3 +78,50 @@ class ObservationOut(BaseModel):
 class CheckResultOut(BaseModel):
     check_run: CheckRunOut
     observation: ObservationOut
+
+
+class HistoryItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    check_run_id: int
+    price: Decimal
+    currency: str
+    price_raw: str
+    observed_at: datetime
+    source_url: str
+
+
+class CheckRunItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    status: str
+    error_code: str | None
+    error_message: str | None
+    http_status: int | None
+    started_at: datetime
+    finished_at: datetime
+    duration_ms: int
+
+
+class CurrencyStatsOut(BaseModel):
+    """Estadísticas de UNA moneda. Los importes son Decimal exactos (texto en JSON)."""
+
+    currency: str
+    count: int
+    min: Decimal
+    min_observed_at: datetime
+    max: Decimal
+    max_observed_at: datetime
+    first: Decimal
+    first_observed_at: datetime
+    latest: Decimal
+    latest_observed_at: datetime
+    change: Decimal
+    change_pct: Decimal
+
+
+class StatsOut(BaseModel):
+    product_id: int
+    by_currency: list[CurrencyStatsOut]

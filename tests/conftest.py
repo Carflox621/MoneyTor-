@@ -128,3 +128,65 @@ def upstream(client):
     app.dependency_overrides[get_http_client] = override_client
     app.dependency_overrides[get_resolver] = lambda: lambda host: fake.dns
     yield fake
+
+
+@pytest.fixture()
+def new_product(session_factory):
+    """Crea un producto directamente en la BD y devuelve su id."""
+    from app.models import Product
+
+    counter = iter(range(1, 10_000))
+
+    def create(store="books.toscrape.com"):
+        with session_factory() as db:
+            product = Product(url=f"https://{store}/p/{next(counter)}", store=store)
+            db.add(product)
+            db.commit()
+            return product.id
+
+    return create
+
+
+@pytest.fixture()
+def seed(session_factory):
+    """Siembra ejecuciones y observaciones con fechas controladas (el sitio real no cambia)."""
+    from datetime import timedelta
+    from decimal import Decimal
+
+    from app.models import CheckRun, PriceHistory
+
+    class Seeder:
+        def run(self, product_id, at, status="success", error_code=None, http_status=200, msg=None):
+            with session_factory() as db:
+                run = CheckRun(
+                    product_id=product_id,
+                    status=status,
+                    error_code=error_code,
+                    error_message=msg,
+                    http_status=http_status,
+                    requested_url="https://books.toscrape.com/p/1",
+                    started_at=at,
+                    finished_at=at + timedelta(milliseconds=5),
+                    duration_ms=5,
+                )
+                db.add(run)
+                db.commit()
+                return run.id
+
+        def observation(self, product_id, price, at, currency="GBP"):
+            run_id = self.run(product_id, at)
+            with session_factory() as db:
+                row = PriceHistory(
+                    product_id=product_id,
+                    check_run_id=run_id,
+                    price=Decimal(str(price)),
+                    currency=currency,
+                    price_raw=f"{currency} {price}",
+                    source_url="https://books.toscrape.com/p/1",
+                    observed_at=at,
+                )
+                db.add(row)
+                db.commit()
+                return row.id
+
+    return Seeder()
